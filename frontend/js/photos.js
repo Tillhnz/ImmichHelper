@@ -3,9 +3,21 @@
 // ===========================================================================
 import { h, icon, clear, api, thumb, videoUrl, immichLink, takenAt, duration, bytes, mp, num, toast, errorToast, confirmDialog, isMobile, state } from "./core.js";
 
+/** Bild nicht geladen (Immich gerade beschäftigt)? Bis zu zweimal neu versuchen, dann einen Platzhalter zeigen. */
+export function retryOnError(img) {
+  let tries = 0;
+  img.addEventListener("error", () => {
+    if (tries >= 2) { img.classList.add("broken"); return; }
+    tries++;
+    const base = img.src.replace(/[?&]r=\d+$/, "");
+    setTimeout(() => { img.src = `${base}${base.includes("?") ? "&" : "?"}r=${tries}`; }, 400 * tries);
+  });
+}
+
 export function tile(a, { badges = [], cls = "" } = {}) {
   const img = h("img", { loading: "lazy", decoding: "async", alt: "", src: thumb(a.id) });
-  img.addEventListener("error", () => { img.style.opacity = "0"; }, { once: true });
+  img.addEventListener("load", () => img.classList.add("ready"), { once: true });
+  retryOnError(img);
   const b = [];
   if (a.type === "V") b.push(h("span", { class: "p-badge" }, icon("play"), a.dur ? duration(a.dur) : "Video"));
   if (a.raw) b.push(h("span", { class: "p-badge" }, "RAW"));

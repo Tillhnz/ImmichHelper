@@ -224,9 +224,22 @@ def test_flow(env):
     _, ov2 = c.get("/api/overview")
     assert ov2["library"]["photos"] + ov2["library"]["videos"] == sum(1 for a in fake.LIB.assets.values() if a["id"] not in fake.LIB.trash)
 
-    # Vorschaubilder und Videos durchreichen
+    # Vorschaubilder: das erste Mal von Immich, danach aus dem Zwischenspeicher (Immich wird nicht erneut gefragt)
     code, body, hdr = c.get(f"/api/thumb/{grp['keep'][0]}", raw=True)
     assert code == 200 and hdr["Content-Type"].startswith("image/") and len(body) > 100
+    before = fake.LIB.thumb_calls
+    code, body2, hdr2 = c.get(f"/api/thumb/{grp['keep'][0]}", raw=True)
+    assert body2 == body and fake.LIB.thumb_calls == before and hdr2["Server-Timing"].startswith("mem")
+    # Die von der Bildprüfung geladenen großen Vorschauen liegen schon bereit
+    code, _, hdr3 = c.get(f"/api/thumb/{grp['keep'][0]}?size=preview", raw=True)
+    assert code == 200 and hdr3["Server-Timing"].split(";")[0] in ("mem", "disk")
+    # Wischen lädt die nächsten Bilder vorab
+    _, q3 = c.get("/api/swipe?source=all&limit=3")
+    time.sleep(1.0)
+    before = fake.LIB.thumb_calls
+    for it in q3["items"]:
+        assert c.get(f"/api/thumb/{it['id']}", raw=True)[0] == 200
+    assert fake.LIB.thumb_calls == before
     vid = next(a for a in fake.LIB.assets.values() if a["type"] == "VIDEO")
     code, body, hdr = c.get(f"/api/video/{vid['id']}", headers={"Range": "bytes=0-99"}, raw=True)
     assert code == 206 and len(body) == 100 and hdr["Content-Range"].startswith("bytes 0-99/")

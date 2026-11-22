@@ -4,7 +4,7 @@
 // ===========================================================================
 import { h, icon, clear, api, state, pageHead, callout, loader, bytes, num, toast, errorToast, confirmDialog, takenAt, duration, thumb, videoUrl, monthLabel, withBusy, empty } from "../core.js";
 import { catByKey } from "./clean.js";
-import { PhotoGrid, undoToast } from "../photos.js";
+import { PhotoGrid, undoToast, retryOnError } from "../photos.js";
 
 const THRESH = 110;
 
@@ -26,6 +26,7 @@ export async function renderSwipe({ el, page, source, refreshOverview }) {
     stage, h("div", { class: "swipe-actions" }, undoBtn, trashBtn, favBtn, keepBtn),
     h("div", { class: "swipe-hint" }, "Nach links wischen: aussortieren · nach rechts: behalten · nach oben: Favorit. Am Rechner: Pfeiltasten, Z = rückgängig."));
 
+  const preloaded = new Set(), keep = [];
   let queue = [], total = 0, since = 0, pending = { count: 0, bytes: 0 }, busy = false, loading = false;
   const done = [];
 
@@ -66,16 +67,25 @@ export async function renderSwipe({ el, page, source, refreshOverview }) {
   }
 
   function card(a, back = false) {
-    const media = a.type === "V"
-      ? h("video", { src: videoUrl(a.id), poster: thumb(a.id, "preview"), controls: true, playsinline: true, preload: "metadata", muted: true })
-      : h("img", { src: thumb(a.id, "preview"), alt: "", draggable: "false" });
+    // Erst das kleine Vorschaubild (meist schon geladen), darüber die große Vorschau, sobald sie da ist – nie ein schwarzes Bild
+    const low = h("img", { class: "sc-low", src: thumb(a.id), alt: "", draggable: "false" });
+    let media;
+    if (a.type === "V") {
+      media = h("video", { src: videoUrl(a.id), poster: thumb(a.id, "preview"), controls: true, playsinline: true, preload: "metadata", muted: true });
+    } else {
+      media = h("img", { class: "sc-hi", src: thumb(a.id, "preview"), alt: "", draggable: "false", decoding: "async", fetchpriority: back ? "auto" : "high" });
+      const show = () => media.classList.add("ready");
+      if (media.complete && media.naturalWidth) show(); else media.addEventListener("load", show, { once: true });
+      retryOnError(media);
+    }
+    retryOnError(low);
     const tags = [];
     if (a.sharp != null && a.sharp < (state.settings.blur_threshold || 35)) tags.push(h("span", { class: "badge bad" }, "wirkt unscharf"));
     if (a.type === "V") tags.push(h("span", { class: "badge" }, `Video ${duration(a.dur)}`));
     if (a.raw) tags.push(h("span", { class: "badge" }, "RAW"));
     if (a.size) tags.push(h("span", { class: "badge" }, bytes(a.size)));
     return h("div", { class: `swipe-card ${back ? "back" : ""}`, "data-id": a.id },
-      media,
+      low, media,
       h("div", { class: "sc-stamp keep" }, "Behalten"), h("div", { class: "sc-stamp trash" }, "Weg"), h("div", { class: "sc-stamp fav" }, "Favorit"),
       h("div", { class: "sc-info" }, h("strong", null, takenAt(a)), h("span", null, [a.place, a.cam].filter(Boolean).join(" · ") || a.name),
         tags.length ? h("div", { class: "sc-tags" }, tags) : null));
@@ -98,8 +108,11 @@ export async function renderSwipe({ el, page, source, refreshOverview }) {
     const top = card(a);
     stage.append(top);
     attachDrag(top);
-    // Vorladen
-    for (const n of queue.slice(2, 5)) if (n.type !== "V") { const i = new Image(); i.src = thumb(n.id, "preview"); }
+    // Die nächsten Bilder schon laden (klein und groß), damit sie beim Wischen sofort da sind
+    const next = queue.slice(1, 9).filter(n => !preloaded.has(n.id));
+    for (const n of next) { preloaded.add(n.id); const lo = new Image(); lo.src = thumb(n.id); keep.push(lo); }
+    for (const n of next) if (n.type !== "V") { const hi = new Image(); hi.decoding = "async"; hi.src = thumb(n.id, "preview"); hi.decode?.().catch(() => {}); keep.push(hi); }
+    while (keep.length > 40) keep.shift();
   }
 
   function attachDrag(c) {

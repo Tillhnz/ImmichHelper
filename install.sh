@@ -115,6 +115,10 @@ IH_IMMICH_URL=${IH_IMMICH_URL:-}
 # Eigenes Zertifikat bei https? Dann 1 = Zertifikat nicht prüfen
 IH_IMMICH_INSECURE=0
 
+# Zwischenspeicher für Vorschaubilder (Arbeitsspeicher / Festplatte des Containers) in MB
+IH_THUMB_MEM_MB=192
+IH_THUMB_DISK_MB=1500
+
 # Wie viele Fotos gleichzeitig geprüft werden (mehr = schneller, aber mehr Last für Immich)
 IH_ANALYZE_WORKERS=4
 

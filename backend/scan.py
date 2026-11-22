@@ -16,7 +16,7 @@ import threading
 import time
 from datetime import datetime
 
-from . import analyze, db, store
+from . import analyze, db, store, thumbs
 from .immich import Immich, ImmichError, duration_ms
 
 log = logging.getLogger("immichhelper.scan")
@@ -230,9 +230,10 @@ def analyze_missing(owner: str, cli: Immich, j: Job) -> None:
     def one(r):
         if j.cancel:
             return None
+        thumbs.wait_for_quiet()  # wer gerade Bilder ansieht, hat Vorrang
         try:
-            with cli.open("GET", f"/assets/{r['id']}/thumbnail", query={"size": "preview"}, timeout=60) as resp:
-                data = resp.read()
+            data, ctype = thumbs.fetch(cli, r["id"], "preview")
+            thumbs.remember(r["id"], "preview", r["checksum"], data, ctype)
             res = analyze.analyze(data)
             return (r["id"], r["checksum"], res["sharp"], res["sharp_g"], res["bright"], res["contrast"], res["dhash"], time.time(), None, res["hi"])
         except ImmichError as e:

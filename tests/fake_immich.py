@@ -6,6 +6,7 @@ Screenshots, WhatsApp-Bilder, Fujifilm RAF+JPG-Paare, kurze Videos und eine Dupl
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import copy
 import glob
@@ -42,6 +43,7 @@ class Lib:
         self.dups: dict[str, list[str]] = {}
         self.tokens: set[str] = set()
         self.calls: list[tuple] = []
+        self.thumb_calls = 0
         self.build()
 
     # -----------------------------------------------------------------------
@@ -298,6 +300,16 @@ async def duplicates(request):
     return JSONResponse(out)
 
 
+_sem = None
+
+
+def _slots():
+    global _sem
+    if _sem is None:
+        _sem = asyncio.Semaphore(int(os.environ.get("FAKE_CONCURRENCY", "100")))
+    return _sem
+
+
 async def thumbnail(request):
     if (r := need(request)):
         return r
@@ -305,6 +317,11 @@ async def thumbnail(request):
     if aid not in LIB.assets:
         return JSONResponse({"message": "Not found"}, status_code=404)
     size = request.query_params.get("size", "thumbnail")
+    LIB.thumb_calls += 1
+    delay = int(os.environ.get("FAKE_DELAY_MS", "0"))
+    if delay:  # langsames Immich nachstellen (z. B. Vorschauen über NFS, nur wenige gleichzeitig)
+        async with _slots():
+            await asyncio.sleep(delay / 1000)
     return Response(LIB.render(aid, size), media_type="image/jpeg" if size == "preview" else "image/webp")
 
 

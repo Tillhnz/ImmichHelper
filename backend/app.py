@@ -19,7 +19,7 @@ from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
-from . import db, scan, store, suggest, updatewatch
+from . import db, scan, store, suggest, thumbs, updatewatch
 from .immich import Immich, ImmichError, is_uuid, normalize_url
 
 BASE = Path(__file__).resolve().parent.parent
@@ -363,6 +363,7 @@ async def swipe(request: Request):
     L = await lib(c)
     lst = await asyncio.to_thread(L.swipe_queue, request.query_params.get("source", "all"))
     out = _page(request, lst, default=150)
+    thumbs.prefetch(c.owner, c.cli, [a["id"] for a in out["items"][:16]])
     out["pending"] = {"count": len(L.pending), "bytes": sum(a.get("size") or 0 for a in L.pending)}
     return JSONResponse(out)
 
@@ -610,12 +611,11 @@ async def thumb(request: Request):
     if not is_uuid(aid):
         return err(400, "Ungültige ID")
     size = "preview" if request.query_params.get("size") == "preview" else "thumbnail"
-
-    def fetch():
-        with c.cli.open("GET", f"/assets/{aid}/thumbnail", query={"size": size}, timeout=60) as r:
-            return r.read(), r.headers.get("Content-Type") or "image/jpeg"
-    data, ctype = await c.call(fetch)
-    return Response(data, media_type=ctype, headers={"Cache-Control": "private, max-age=604800, immutable"})
+    t0 = time.perf_counter()
+    data, ctype, src = await c.call(thumbs.get, c.owner, c.cli, aid, size)
+    ms = (time.perf_counter() - t0) * 1000
+    return Response(data, media_type=ctype, headers={"Cache-Control": "private, max-age=604800, immutable",
+                                                     "Server-Timing": f"{src};dur={ms:.1f}"})
 
 
 async def _stream(c: Ctx, request: Request, path: str, extra_headers: dict | None = None):
