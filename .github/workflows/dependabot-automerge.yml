@@ -1,0 +1,63 @@
+name: Dependabot automatisch übernehmen
+
+# Übernimmt Pull Requests von Dependabot, sobald die CI (Tests) grün ist –
+# aber nur kleine Updates (Patch/Minor) und Sicherheitskorrekturen. Große Versionssprünge (Major)
+# bleiben offen, weil sie Code-Änderungen brauchen können.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+
+jobs:
+  retry:
+    # GitHub startet gelegentlich einzelne Jobs gar nicht (Lauf „fehlgeschlagen“, aber kein Job mit Fehler):
+    # dann einmal neu starten, statt das Update liegen zu lassen
+    if: github.event.workflow_run.conclusion == 'failure' && github.event.workflow_run.run_attempt == 1
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RUN: ${{ github.event.workflow_run.id }}
+    steps:
+      - run: |
+          failed=$(gh api "repos/$GH_REPO/actions/runs/$RUN/jobs" --jq '[.jobs[] | select(.conclusion == "failure")] | length')
+          if [ "$failed" = "0" ]; then gh api -X POST "repos/$GH_REPO/actions/runs/$RUN/rerun" && echo "Neu gestartet"; else echo "Echter Fehler in $failed Job(s)"; fi
+
+  merge:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      startsWith(github.event.workflow_run.head_branch, 'dependabot/')
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      BRANCH: ${{ github.event.workflow_run.head_branch }}
+      SHA: ${{ github.event.workflow_run.head_sha }}
+    steps:
+      - name: Pull Request prüfen und übernehmen
+        run: |
+          set -euo pipefail
+          pr=$(gh pr list --head "$BRANCH" --state open --json number,author,title,headRefOid --jq '.[0]')
+          [ -n "$pr" ] || { echo "Kein offener Pull Request"; exit 0; }
+          num=$(jq -r .number <<<"$pr"); author=$(jq -r .author.login <<<"$pr"); title=$(jq -r .title <<<"$pr")
+          [ "$(jq -r .headRefOid <<<"$pr")" = "$SHA" ] || { echo "Neuerer Stand vorhanden, warte"; exit 0; }
+          [[ "$author" == "dependabot[bot]" || "$author" == "app/dependabot" ]] || { echo "Nicht von Dependabot"; exit 0; }
+          # Major-Sprünge (z. B. „from 4.2.1 to 5.0.0“) nicht automatisch – auch in Sammel-PRs, die mehrere Pakete
+          # nur im Text aufzählen („Updates `vite` from 7.1.0 to 8.3.6“)
+          body=$(gh pr view "$num" --json body --jq .body)
+          # Auch Bereichs-Updates wie „from >=9.1.0 to >=9.2.0“ erkennen. „|| true“: Ohne Treffer liefert grep
+          # Fehlercode 1 – mit „set -o pipefail“ brach der Schritt sonst ab, bevor überhaupt übernommen wurde.
+          major=$(printf '%s\n%s\n' "$title" "$body" | grep -oE 'from [<>=~^]*v?[0-9][^ ]* to [<>=~^]*v?[0-9][^ ]*' \
+            | awk '{f=$2; t=$4; gsub(/[^0-9.]/,"",f); gsub(/[^0-9.]/,"",t); split(f,a,"."); split(t,b,"."); if (a[1] != b[1]) print}' | head -1 || true)
+          if [ -n "$major" ]; then
+            gh pr comment "$num" --body "Großer Versionssprung ($major) – bitte selbst prüfen. (Automatisch übernommen werden nur kleine Updates.)"
+            exit 0
+          fi
+          gh pr merge "$num" --squash --delete-branch
+          echo "Übernommen: $title"

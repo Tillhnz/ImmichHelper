@@ -1,0 +1,44 @@
+name: Sicherheit
+
+# Prüft alle Abhängigkeiten auf bekannte Lücken: bei jeder Änderung und jeden Morgen, damit auch Lücken
+# auffallen, die nach dem letzten Commit bekannt werden. Schlägt die Prüfung fehl, schickt GitHub eine E-Mail.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "30 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    name: Python-Pakete
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - run: pip install pip-audit
+      - name: pip-audit (auch indirekte Abhängigkeiten)
+        run: |
+          pip-audit -r backend/requirements.txt --desc on -f json -o audit.json || true
+          python - <<'PY'
+          import json, sys
+          data = json.load(open("audit.json"))
+          deps = data.get("dependencies", data) if isinstance(data, dict) else data
+          seen, bad = set(), []
+          for d in deps:
+              for v in d.get("vulns", []):
+                  if (d["name"], v["id"]) not in seen:
+                      seen.add((d["name"], v["id"]))
+                      bad.append((d["name"], d["version"], v))
+          for name, ver, v in bad:
+              fix = ", ".join(v.get("fix_versions") or []) or "noch keine"
+              print(f"::error title=Lücke in {name} {ver}::{v['id']} {' '.join(v.get('aliases', []))} – behoben in: {fix}")
+          print(f"{len(bad)} bekannte Lücken in Python-Paketen")
+          sys.exit(1 if bad else 0)
+          PY

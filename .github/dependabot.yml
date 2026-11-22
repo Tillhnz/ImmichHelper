@@ -1,0 +1,27 @@
+# Dependabot hält die Abhängigkeiten aktuell (gleich eingerichtet wie bei den anderen Helpern).
+# - Sicherheitslücken: sofort ein eigener Pull Request (in GitHub unter Settings → Code security
+#   „Dependabot alerts“ und „Dependabot security updates“ – ist eingeschaltet).
+# - Alles andere: einmal pro Woche gesammelt. Kleine Updates werden nach grüner CI automatisch übernommen
+#   (.github/workflows/dependabot-automerge.yml), große Versionssprünge bleiben zum Ansehen liegen.
+# - Danach meldet ImmichHelper selbst per Push (ntfy), dass ein Update bereitliegt.
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /backend
+    schedule: { interval: weekly, day: monday, time: "05:00", timezone: Europe/Berlin }
+    open-pull-requests-limit: 5
+    ignore:
+      # Große Versionssprünge brauchen oft Code-Änderungen: keine wöchentlichen PRs dafür.
+      # Sicherheitskorrekturen kommen trotzdem, auch wenn sie einen großen Sprung brauchen.
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+    groups:
+      python:
+        patterns: ["*"]
+        update-types: [minor, patch]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: monthly }
+    groups:
+      actions:
+        patterns: ["*"]
