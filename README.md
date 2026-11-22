@@ -28,7 +28,7 @@ Favoriten werden nie vorgeschlagen (einstellbar). Alles, was du einmal „behalt
 **Außerdem**
 - **Verlauf** mit Wiederherstellen und „Immich-Papierkorb leeren“. Erst nach dem Leeren wird der Platz auf der NAS frei.
 - **Anmeldung mit dem Immich-Konto.** Jeder sieht nur seine eigenen Fotos, eigene Benutzer gibt es nicht. Wahlweise geht die Anmeldung auch mit einem API-Schlüssel (z. B. bei OAuth).
-- **Schnelle Vorschauen:** Vorschaubilder werden zwischengespeichert, im Arbeitsspeicher und auf der Festplatte des Containers (Standard 192 MB bzw. 1,5 GB, einstellbar mit `IH_THUMB_MEM_MB`/`IH_THUMB_DISK_MB`). Aus dem Speicher kommen sie in wenigen Millisekunden. Beim Wischen werden die nächsten Bilder vorab geladen, und die Bildprüfung im Hintergrund macht Pause, solange du Fotos ansiehst.
+- **Schnell und sparsam, auch bei großen Bibliotheken:** Bei rund 37.000 Fotos braucht ImmichHelper etwa 140 MB Arbeitsspeicher, und eine Entscheidung beim Wischen dauert rund 10 ms. Vorschaubilder werden zwischengespeichert: die kleinen zusätzlich im Arbeitsspeicher (`IH_THUMB_MEM_MB`, Standard 48), alle auf der Festplatte des Containers (`IH_THUMB_DISK_MB`, Standard 1500). Beim Wischen werden die nächsten Bilder vorab geladen. Was du gerade ansiehst, hat Vorrang vor Vorladen und Bildprüfung, und Immich bekommt nie mehr als 8 Bildanfragen gleichzeitig (`IH_IMMICH_PARALLEL`).
 - **Liest automatisch neu ein** (Standard: alle 12 Stunden) und prüft dabei nur neue Fotos
 - Fürs Handy gemacht, hell und dunkel, alles auf Deutsch
 

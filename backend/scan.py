@@ -16,11 +16,11 @@ import threading
 import time
 from datetime import datetime
 
-from . import analyze, db, store, thumbs
+from . import analyze, db, store, suggest, thumbs
 from .immich import Immich, ImmichError, duration_ms
 
 log = logging.getLogger("immichhelper.scan")
-WORKERS = int(os.environ.get("IH_ANALYZE_WORKERS", "4"))
+WORKERS = max(1, min(4, int(os.environ.get("IH_ANALYZE_WORKERS", "3"))))
 
 
 class Job:
@@ -216,10 +216,10 @@ def sync(owner: str, cli: Immich, j: Job) -> None:
 
 
 def analyze_missing(owner: str, cli: Immich, j: Job) -> None:
-    rows = db.q("""SELECT a.id, a.checksum FROM assets a LEFT JOIN analysis n ON n.id = a.id
+    rows = [(r[0], r[1]) for r in db.q("""SELECT a.id, a.checksum FROM assets a LEFT JOIN analysis n ON n.id = a.id
                    WHERE a.owner=? AND a.type='IMAGE' AND a.trashed=0 AND a.gone IS NULL
                      AND (n.id IS NULL OR IFNULL(n.checksum,'') != IFNULL(a.checksum,'') OR (n.hi IS NULL AND n.err IS NULL))
-                   ORDER BY a.taken DESC""", (owner,))
+                   ORDER BY a.taken DESC""", (owner,))]
     j.phase = "analysis"
     j.total = len(rows)
     j.done = 0
@@ -232,37 +232,55 @@ def analyze_missing(owner: str, cli: Immich, j: Job) -> None:
             return None
         thumbs.wait_for_quiet()  # wer gerade Bilder ansieht, hat Vorrang
         try:
-            data, ctype = thumbs.fetch(cli, r["id"], "preview")
-            thumbs.remember(r["id"], "preview", r["checksum"], data, ctype)
+            data, ctype = thumbs.fetch(cli, r[0], "preview", analysis=True)
+            thumbs.remember(r[0], "preview", r[1], data, ctype)
+            del ctype
             res = analyze.analyze(data)
-            return (r["id"], r["checksum"], res["sharp"], res["sharp_g"], res["bright"], res["contrast"], res["dhash"], time.time(), None, res["hi"])
+            return (r[0], r[1], res["sharp"], res["sharp_g"], res["bright"], res["contrast"], res["dhash"], time.time(), None, res["hi"])
         except ImmichError as e:
             if e.status == 401:
                 raise
-            return (r["id"], r["checksum"], None, None, None, None, None, time.time(), e.message[:200], None)
+            return (r[0], r[1], None, None, None, None, None, time.time(), e.message[:200], None)
         except Exception as e:  # noqa: BLE001 – kaputtes Vorschaubild o. ä.
-            return (r["id"], r["checksum"], None, None, None, None, None, time.time(), str(e)[:200], None)
+            return (r[0], r[1], None, None, None, None, None, time.time(), str(e)[:200], None)
 
     sql = "INSERT OR REPLACE INTO analysis (id, checksum, sharp, sharp_g, bright, contrast, dhash, ts, err, hi) VALUES (?,?,?,?,?,?,?,?,?,?)"
     buf: list[tuple] = []
-    last_bump = time.time()
-    with cf.ThreadPoolExecutor(max_workers=WORKERS) as ex:
-        for res in ex.map(one, rows):
+
+    def flush():
+        if buf:
+            db.many(sql, buf)
+            suggest.update_analysis(owner, [(r[0], r[2], r[4], r[5], r[9], r[6]) for r in buf if r[2] is not None])
+            buf.clear()
+
+    # Höchstens ein paar Aufträge gleichzeitig unterwegs (nicht alle 40.000 auf einmal in die Warteschlange)
+    it = iter(rows)
+    with cf.ThreadPoolExecutor(max_workers=WORKERS, thread_name_prefix="analyze") as ex:
+        window = set()
+        for r in it:
+            window.add(ex.submit(one, r))
+            if len(window) < WORKERS * 2:
+                continue
+            done, window = cf.wait(window, return_when=cf.FIRST_COMPLETED)
+            for f in done:
+                res = f.result()
+                j.done += 1
+                if res:
+                    buf.append(res)
+                    if res[2] is not None:
+                        j.analyzed += 1
+            if len(buf) >= 100:
+                flush()
+            if j.cancel:
+                break
+        for f in cf.as_completed(window):
+            res = f.result()
             j.done += 1
             if res:
                 buf.append(res)
                 if res[2] is not None:
                     j.analyzed += 1
-            if len(buf) >= 50:
-                db.many(sql, buf)
-                buf = []
-                if time.time() - last_bump > 20:
-                    db.bump(owner)
-                    last_bump = time.time()
-            if j.cancel:
-                break
-    if buf:
-        db.many(sql, buf)
+    flush()
 
 
 # ---------------------------------------------------------------------------

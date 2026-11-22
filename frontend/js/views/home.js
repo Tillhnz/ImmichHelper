@@ -76,6 +76,7 @@ export async function renderHome({ el, page, refreshOverview, startSync }) {
   }
   await draw();
   page.on("ih:synced", draw);
-  page.on("ih:progress", draw);
+  let lastProgress = 0;
+  page.on("ih:progress", () => { if (Date.now() - lastProgress > 30000) { lastProgress = Date.now(); draw(); } });
   page.on("ih:changed", () => refreshOverview());
 }

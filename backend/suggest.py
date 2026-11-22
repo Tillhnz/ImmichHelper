@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 import threading
 from collections import Counter, defaultdict
 from datetime import date, datetime
@@ -36,7 +37,6 @@ MESSENGER = [
 MESSENGER_PATH = [("whatsapp", "WhatsApp", re.compile(r"/whatsapp", re.I)), ("telegram", "Telegram", re.compile(r"/telegram", re.I)),
                   ("signal", "Signal", re.compile(r"/signal/", re.I))]
 
-_cache: dict[str, tuple] = {}
 _cache_lock = threading.Lock()
 
 
@@ -127,35 +127,125 @@ def month_label(d: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Kompakter Speicher für Fotos: ein schlankes Objekt je Foto statt eines Wörterbuchs
+# (bei 40.000 Fotos ca. 25 MB statt über 200 MB) – und es wird nicht bei jedem Wisch neu aufgebaut,
+# sondern direkt geändert.
+# ---------------------------------------------------------------------------
+_FIELDS = ("id", "type", "name", "path", "taken", "local", "size", "w", "h", "make", "model", "city", "state", "country",
+           "dur", "fav", "archived", "dup", "stack", "stack_primary", "in_album", "trashed", "gone",
+           "sharp", "bright", "contrast", "hi", "dhash", "decision", "committed")
+_SLOTS = _FIELDS + ("src", "raw", "stem")  # einmal berechnet: Herkunft, RAW-Datei?, Dateiname ohne Endung
+_INTERN = {"type", "make", "model", "city", "state", "country", "decision"}
+
+
+class Asset:
+    __slots__ = _SLOTS
+
+    def __getitem__(self, k):
+        return getattr(self, k)
+
+    def get(self, k, default=None):
+        v = getattr(self, k, default)
+        return default if v is None else v
+
+
+def _asset(row) -> Asset:
+    a = Asset()
+    for f in _FIELDS:
+        v = row[f]
+        if f in _INTERN and v is not None:
+            v = sys.intern(v)
+        elif f in ("sharp", "bright", "contrast", "hi") and v is not None:
+            v = round(v, 1)
+        elif f == "gone":
+            v = None if v is None else 1
+        setattr(a, f, v)
+    a.src = source_of(a)
+    a.raw = is_raw(a)
+    a.stem = sys.intern(stem(a.name))
+    return a
+
+
 class Library:
-    """Alle Fotos und Videos eines Benutzers im Speicher – Ergebnisse werden zwischengespeichert."""
+    """Alle Fotos und Videos eines Benutzers im Speicher.
+
+    Die Fotos werden nur nach dem Einlesen neu geladen. Entscheidungen, Löschen, Prüfergebnisse usw. ändern die
+    Objekte direkt (siehe update()) – danach werden nur die abgeleiteten Listen und Vorschläge neu berechnet,
+    und zwar erst, wenn sie gebraucht werden.
+    """
 
     def __init__(self, owner: str):
         self.owner = owner
-        self.settings = db.user_settings(owner)
-        rows = db.q("""SELECT a.*, n.sharp, n.sharp_g, n.bright, n.contrast, n.dhash, n.hi, d.decision, d.committed
+        self.gen = db.version(owner)
+        rows = db.q("""SELECT a.id, a.type, a.name, a.path, a.taken, a.local, a.size, a.w, a.h, a.make, a.model, a.city, a.state,
+                              a.country, a.dur, a.fav, a.archived, a.dup, a.stack, a.stack_primary, a.in_album, a.trashed, a.gone,
+                              n.sharp, n.bright, n.contrast, n.hi, n.dhash, d.decision, d.committed
                        FROM assets a
                        LEFT JOIN analysis n ON n.id = a.id AND IFNULL(n.checksum,'') = IFNULL(a.checksum,'')
                        LEFT JOIN decisions d ON d.owner = a.owner AND d.id = a.id
                        WHERE a.owner = ?""", (owner,))
-        self.all = [dict(r) for r in rows]
-        self.by_id = {a["id"]: a for a in self.all}
-        self.live = [a for a in self.all if not a["trashed"] and a["gone"] is None]
-        self.live.sort(key=lambda a: a["taken"] or 0)
-        s = self.settings
-        self.pool = [a for a in self.live
-                     if a.get("decision") not in ("keep", "fav")
-                     and (s["include_favorites"] or not a["fav"])
-                     and (s["include_archived"] or not a["archived"])
-                     and not (a.get("stack") and a.get("stack_primary") == 0 and not is_raw(a))]
-        self.pending = [a for a in self.live if a.get("decision") == "trash" and not a.get("committed")]
-        self._memo: dict = {}
+        self.all = [_asset(r) for r in rows]
+        del rows
+        self.all.sort(key=lambda a: a.taken or 0)
+        self.by_id = {a.id: a for a in self.all}
         self.dupgroups = {r["dup_id"]: json.loads(r["suggested"] or "[]") for r in db.q("SELECT * FROM dupgroups WHERE owner=?", (owner,))}
+        self._stamp = 0
+        self._memo: dict = {}
+        self._mlock = threading.RLock()
+        self._derived = None
+
+    # Änderungen ---------------------------------------------------------------
+    def touch(self) -> None:
+        with self._mlock:
+            self._stamp += 1
+            self._memo = {}
+            self._derived = None
+
+    def _d(self):
+        d = self._derived
+        if d is not None:
+            return d
+        with self._mlock:
+            if self._derived is None:
+                s = db.user_settings(self.owner)
+                live = [a for a in self.all if not a.trashed and a.gone is None]
+                pool = [a for a in live
+                        if a.decision not in ("keep", "fav")
+                        and (s["include_favorites"] or not a.fav)
+                        and (s["include_archived"] or not a.archived)
+                        and not (a.stack and a.stack_primary == 0 and not a.raw)]
+                pending = [a for a in live if a.decision == "trash" and not a.committed]
+                self._derived = (s, live, pool, pending)
+            return self._derived
+
+    @property
+    def settings(self) -> dict:
+        return self._d()[0]
+
+    @property
+    def live(self) -> list:
+        return self._d()[1]
+
+    @property
+    def pool(self) -> list:
+        return self._d()[2]
+
+    @property
+    def pending(self) -> list:
+        return self._d()[3]
 
     def memo(self, key, fn):
-        if key not in self._memo:
-            self._memo[key] = fn()
-        return self._memo[key]
+        hit = self._memo.get(key)
+        if hit is not None:
+            return hit
+        with self._mlock:  # nur einer rechnet, die anderen warten auf das Ergebnis
+            hit = self._memo.get(key)
+            if hit is None:
+                stamp = self._stamp
+                hit = fn()
+                if stamp == self._stamp:
+                    self._memo[key] = hit
+            return hit
 
     # ------------------------------------------------------------------ Kategorien
     def category(self, name: str) -> list[dict]:
@@ -163,29 +253,29 @@ class Library:
 
     def _category(self, name: str) -> list[dict]:
         s = self.settings
-        imgs = [a for a in self.pool if a["type"] == "IMAGE"]
+        imgs = [a for a in self.pool if a.type == "IMAGE"]
         if name == "blurry":
-            out = [a for a in imgs if a.get("sharp") is not None and a["sharp"] < s["blur_threshold"]
-                   and (a.get("bright") or 0) >= 25 and (a.get("contrast") or 0) >= 6 and not is_raw(a)]
-            return sorted(out, key=lambda a: a["sharp"])
+            out = [a for a in imgs if a.sharp is not None and a.sharp < s["blur_threshold"]
+                   and (a.bright or 0) >= 25 and (a.contrast or 0) >= 6 and not a.raw]
+            return sorted(out, key=lambda a: a.sharp)
         if name == "dark":
-            out = [a for a in imgs if a.get("bright") is not None and _misfire(a)]
-            return sorted(out, key=lambda a: (a.get("contrast") or 0))
+            out = [a for a in imgs if a.bright is not None and _misfire(a)]
+            return sorted(out, key=lambda a: (a.contrast or 0))
         if name == "screenshots":
-            return sorted([a for a in self.pool if source_of(a)[2] == "screen"], key=lambda a: -(a["taken"] or 0))
+            return sorted([a for a in self.pool if a.src[2] == "screen"], key=lambda a: -(a.taken or 0))
         if name == "messenger":
-            return sorted([a for a in self.pool if source_of(a)[2] == "messenger"], key=lambda a: -(a["taken"] or 0))
+            return sorted([a for a in self.pool if a.src[2] == "messenger"], key=lambda a: -(a.taken or 0))
         if name == "shortvideos":
             lim = s["short_video_s"] * 1000
-            return sorted([a for a in self.pool if a["type"] == "VIDEO" and a.get("dur") and a["dur"] < lim],
-                          key=lambda a: a["dur"])
+            return sorted([a for a in self.pool if a.type == "VIDEO" and a.dur and a.dur < lim],
+                          key=lambda a: a.dur)
         if name == "large":
             lim = s["large_mb"] * 1024 * 1024
-            return sorted([a for a in self.pool if (a.get("size") or 0) >= lim], key=lambda a: -(a["size"] or 0))
+            return sorted([a for a in self.pool if (a.size or 0) >= lim], key=lambda a: -(a.size or 0))
         if name == "raworphans":
             return self.raw_info()["orphans"]
         if name == "noalbum":
-            return sorted([a for a in self.live if not a["in_album"]], key=lambda a: -(a["taken"] or 0))
+            return sorted([a for a in self.live if not a.in_album], key=lambda a: -(a.taken or 0))
         raise KeyError(name)
 
     # ------------------------------------------------------------------ Duplikate
@@ -195,20 +285,20 @@ class Library:
     def _duplicates(self) -> list[dict]:
         groups = defaultdict(list)
         for a in self.live:
-            if a.get("dup"):
-                groups[a["dup"]].append(a)
+            if a.dup:
+                groups[a.dup].append(a)
         out = []
         for did, members in groups.items():
             if len(members) < 2:
                 continue
-            ids = {a["id"] for a in members}
+            ids = {a.id for a in members}
             sugg = [i for i in self.dupgroups.get(did, []) if i in ids]
             if not sugg:
-                best = max(members, key=lambda a: (bool(a["fav"]), (a.get("w") or 0) * (a.get("h") or 0), a.get("size") or 0,
-                                                   bool(a.get("city")), a.get("sharp") or 0))
-                sugg = [best["id"]]
-            members.sort(key=lambda a: (a["id"] not in sugg, -(a.get("size") or 0)))
-            save = sum((a.get("size") or 0) for a in members if a["id"] not in sugg)
+                best = max(members, key=lambda a: (bool(a.fav), (a.w or 0) * (a.h or 0), a.size or 0,
+                                                   bool(a.city), a.sharp or 0))
+                sugg = [best.id]
+            members.sort(key=lambda a: (a.id not in sugg, -(a.size or 0)))
+            save = sum((a.size or 0) for a in members if a.id not in sugg)
             out.append({"key": did, "assets": members, "keep": sugg, "bytes": save, "taken": members[0].get("taken")})
         out.sort(key=lambda g: -(g["taken"] or 0))
         return out
@@ -220,15 +310,15 @@ class Library:
     def _bursts(self) -> list[dict]:
         s = self.settings
         gap, sim = s["burst_seconds"], s["burst_similarity"]
-        imgs = [a for a in self.pool if a["type"] == "IMAGE" and not is_raw(a) and not a.get("dup") and a.get("taken")]
-        imgs.sort(key=lambda a: a["taken"])
+        imgs = [a for a in self.pool if a.type == "IMAGE" and not a.raw and not a.dup and a.taken]
+        imgs.sort(key=lambda a: a.taken)
         groups, cur = [], []
         for a in imgs:
             if cur:
                 p = cur[-1]
-                dt = a["taken"] - p["taken"]
-                if a.get("dhash") is not None and p.get("dhash") is not None:
-                    ok = dt <= gap and hamming(a["dhash"], p["dhash"]) <= sim
+                dt = a.taken - p.taken
+                if a.dhash is not None and p.dhash is not None:
+                    ok = dt <= gap and hamming(a.dhash, p.dhash) <= sim
                 else:
                     ok = dt <= min(gap, 1.5)
                 if ok and len(cur) < 60:
@@ -241,9 +331,9 @@ class Library:
             groups.append(cur)
         out = []
         for g in groups:
-            best = max(g, key=lambda a: (bool(a["fav"]), a.get("sharp") or 0, a.get("size") or 0))
-            save = sum((a.get("size") or 0) for a in g if a is not best)
-            out.append({"key": g[0]["id"], "assets": g, "keep": [best["id"]], "bytes": save, "taken": g[0]["taken"]})
+            best = max(g, key=lambda a: (bool(a.fav), a.sharp or 0, a.size or 0))
+            save = sum((a.size or 0) for a in g if a is not best)
+            out.append({"key": g[0]["id"], "assets": g, "keep": [best.id], "bytes": save, "taken": g[0]["taken"]})
         out.sort(key=lambda x: -(x["taken"] or 0))
         return out
 
@@ -254,25 +344,25 @@ class Library:
     def _raw_info(self) -> dict:
         partners = defaultdict(list)  # stem → nicht-RAW-Dateien (auch gelöschte)
         for a in self.all:
-            if not is_raw(a) and a["type"] == "IMAGE":
-                partners[stem(a["name"])].append(a)
+            if not a.raw and a.type == "IMAGE":
+                partners[a.stem].append(a)
         pairs, orphans, raw_only, raw_bytes = [], [], 0, 0
         for r in self.live:
-            if not is_raw(r):
+            if not r.raw:
                 continue
-            raw_bytes += r.get("size") or 0
-            cand = [p for p in partners.get(stem(r["name"]), []) if abs((p.get("taken") or 0) - (r.get("taken") or 0)) <= 3]
-            alive = [p for p in cand if not p["trashed"] and p["gone"] is None and not (p.get("decision") == "trash")]
+            raw_bytes += r.size or 0
+            cand = [p for p in partners.get(r.stem, []) if abs((p.taken or 0) - (r.taken or 0)) <= 3]
+            alive = [p for p in cand if not p.trashed and p.gone is None and not (p.decision == "trash")]
             if alive:
                 j = alive[0]
-                stacked = bool(r.get("stack")) and r.get("stack") == j.get("stack")
+                stacked = bool(r.stack) and r.stack == j.stack
                 pairs.append({"raw": r, "jpg": j, "stacked": stacked})
             elif cand:
-                if r.get("decision") not in ("keep", "fav") and (self.settings["include_favorites"] or not r["fav"]):
+                if r.decision not in ("keep", "fav") and (self.settings["include_favorites"] or not r.fav):
                     orphans.append(r)
             else:
                 raw_only += 1
-        orphans.sort(key=lambda a: -(a["taken"] or 0))
+        orphans.sort(key=lambda a: -(a.taken or 0))
         return {"pairs": pairs, "unstacked": [p for p in pairs if not p["stacked"]], "orphans": orphans,
                 "raw_only": raw_only, "raw_bytes": raw_bytes}
 
@@ -281,16 +371,16 @@ class Library:
         want = {}
         for i in ids:
             a = self.by_id.get(i)
-            if a and not is_raw(a):
-                want[stem(a["name"])] = a
+            if a and not a.raw:
+                want[a.stem] = a
         if not want:
             return []
         out = []
         for r in self.live:
-            if is_raw(r) and r["id"] not in ids and r.get("decision") not in ("keep", "fav") and not r["fav"]:
-                j = want.get(stem(r["name"]))
-                if j and abs((j.get("taken") or 0) - (r.get("taken") or 0)) <= 3:
-                    out.append(r["id"])
+            if r.raw and r.id not in ids and r.decision not in ("keep", "fav") and not r.fav:
+                j = want.get(r.stem)
+                if j and abs((j.taken or 0) - (r.taken or 0)) <= 3:
+                    out.append(r.id)
         return out
 
     # ------------------------------------------------------------------ Ordnen
@@ -298,12 +388,12 @@ class Library:
         return self.memo("events", self._events)
 
     def _events(self) -> list[dict]:
-        items = [a for a in self.live if a.get("taken") and not (a.get("decision") == "trash")]
+        items = [a for a in self.live if a.taken and not (a.decision == "trash")]
         if not items:
             return []
-        cities = Counter(a["city"] for a in items if a.get("city"))
+        cities = Counter(a.city for a in items if a.city)
         home = cities.most_common(1)[0][0] if cities else None
-        home_country = Counter(a["country"] for a in items if a.get("city") == home and a.get("country")).most_common(1)
+        home_country = Counter(a.country for a in items if a.city == home and a.country).most_common(1)
         home_country = home_country[0][0] if home_country else None
         days: dict[str, list] = defaultdict(list)
         for a in items:
@@ -313,7 +403,7 @@ class Library:
             if d == "0000-00-00":
                 continue
             lst = days[d]
-            loc = Counter((a.get("country"), a.get("state"), a.get("city")) for a in lst if a.get("city") or a.get("country"))
+            loc = Counter((a.country, a.state, a.city) for a in lst if a.city or a.country)
             dom = loc.most_common(1)[0][0] if loc else None
             away = None if dom is None else (dom[2] != home)
             info.append({"day": d, "items": lst, "dom": dom, "away": away})
@@ -358,16 +448,16 @@ class Library:
                     else f"{place}, {first.day}. {MONTHS[first.month - 1]} {first.year}"
             else:
                 album = when
-            in_album = sum(1 for a in lst if a["in_album"])
+            in_album = sum(1 for a in lst if a.in_album)
             if c["away"] or not place:
                 title, subtitle = place or when, when if place else None
             else:  # zu Hause: der Tag ist wichtiger als der Ort
                 title, subtitle = f"{WEEKDAYS[first.weekday()]}, {when}" if c["first"] == c["last"] else when, place
             out.append({"key": f"{c['first'].isoformat()}_{c['last'].isoformat()}", "title": title,
                         "subtitle": subtitle, "album": album, "count": len(lst),
-                        "photos": sum(1 for a in lst if a["type"] == "IMAGE"), "videos": sum(1 for a in lst if a["type"] == "VIDEO"),
+                        "photos": sum(1 for a in lst if a.type == "IMAGE"), "videos": sum(1 for a in lst if a.type == "VIDEO"),
                         "in_album": in_album, "away": bool(c["away"]), "days": (c["last"] - c["first"]).days + 1,
-                        "cover": _cover(lst)["id"], "ids": [a["id"] for a in lst], "bytes": sum(a.get("size") or 0 for a in lst),
+                        "cover": _cover(lst)["id"], "ids": [a.id for a in lst], "bytes": sum(a.size or 0 for a in lst),
                         "first": c["first"].isoformat()})
         out.sort(key=lambda e: e["first"], reverse=True)
         return out
@@ -377,18 +467,18 @@ class Library:
             groups = defaultdict(list)
             labels = {}
             for a in self.live:
-                if a.get("decision") == "trash":
+                if a.decision == "trash":
                     continue
-                k, label, kind = source_of(a)
+                k, label, kind = a.src
                 groups[k].append(a)
                 labels[k] = (label, kind)
             out = []
             for k, lst in groups.items():
-                lst.sort(key=lambda a: -(a["taken"] or 0))
+                lst.sort(key=lambda a: -(a.taken or 0))
                 label, kind = labels[k]
-                out.append({"key": k, "title": label, "kind": kind, "count": len(lst), "in_album": sum(1 for a in lst if a["in_album"]),
-                            "cover": _cover(lst)["id"], "ids": [a["id"] for a in lst], "album": label,
-                            "bytes": sum(a.get("size") or 0 for a in lst)})
+                out.append({"key": k, "title": label, "kind": kind, "count": len(lst), "in_album": sum(1 for a in lst if a.in_album),
+                            "cover": _cover(lst)["id"], "ids": [a.id for a in lst], "album": label,
+                            "bytes": sum(a.size or 0 for a in lst)})
             out.sort(key=lambda g: -g["count"])
             return out
         return self.memo("sources", build)
@@ -397,24 +487,24 @@ class Library:
         def build():
             by_country: dict[str, list] = defaultdict(list)
             for a in self.live:
-                if a.get("country") and a.get("decision") != "trash":
-                    by_country[a["country"]].append(a)
+                if a.country and a.decision != "trash":
+                    by_country[a.country].append(a)
             out = []
             for country, lst in by_country.items():
                 cities = defaultdict(list)
                 for a in lst:
-                    cities[a.get("city") or "–"].append(a)
+                    cities[a.city or "–"].append(a)
                 city_list = []
                 for city, cl in cities.items():
                     city_list.append({"key": f"place:{country}:{city}", "title": city if city != "–" else "Ohne Ort",
-                                      "count": len(cl), "cover": _cover(cl)["id"], "ids": [a["id"] for a in cl],
-                                      "album": f"{city}" if city != "–" else country, "in_album": sum(1 for a in cl if a["in_album"])})
+                                      "count": len(cl), "cover": _cover(cl)["id"], "ids": [a.id for a in cl],
+                                      "album": f"{city}" if city != "–" else country, "in_album": sum(1 for a in cl if a.in_album)})
                 city_list.sort(key=lambda c: -c["count"])
                 years = sorted({day_of(a)[:4] for a in lst})
                 out.append({"key": f"place:{country}", "title": country, "count": len(lst), "cover": _cover(lst)["id"],
-                            "ids": [a["id"] for a in lst], "album": country, "cities": city_list,
+                            "ids": [a.id for a in lst], "album": country, "cities": city_list,
                             "years": f"{years[0]}–{years[-1]}" if len(years) > 1 else years[0],
-                            "in_album": sum(1 for a in lst if a["in_album"])})
+                            "in_album": sum(1 for a in lst if a.in_album)})
             out.sort(key=lambda c: -c["count"])
             return out
         return self.memo("places", build)
@@ -423,9 +513,9 @@ class Library:
         def build():
             dirs = defaultdict(list)
             for a in self.live:
-                if a.get("decision") == "trash" or not a.get("path"):
+                if a.decision == "trash" or not a.path:
                     continue
-                dirs[os.path.dirname(a["path"])].append(a)
+                dirs[os.path.dirname(a.path)].append(a)
             if not dirs:
                 return {"folders": [], "random": False}
             common = os.path.commonpath(list(dirs)) if len(dirs) > 1 else os.path.dirname(next(iter(dirs)))
@@ -436,8 +526,8 @@ class Library:
                     hashy += len(lst)
                 name = rel if rel != "." else os.path.basename(d) or d
                 out.append({"key": f"dir:{d}", "title": name, "path": d, "count": len(lst), "cover": _cover(lst)["id"],
-                            "ids": [a["id"] for a in lst], "album": os.path.basename(d) or name,
-                            "in_album": sum(1 for a in lst if a["in_album"])})
+                            "ids": [a.id for a in lst], "album": os.path.basename(d) or name,
+                            "in_album": sum(1 for a in lst if a.in_album)})
             out.sort(key=lambda f: f["title"].lower())
             total = sum(f["count"] for f in out)
             return {"folders": out, "random": total > 0 and hashy / total > 0.5, "root": common}
@@ -469,18 +559,18 @@ class Library:
     def months(self) -> list[dict]:
         def build():
             m = defaultdict(lambda: [0, 0])
-            open_ids = {a["id"] for a in self.pool if not a.get("decision")}
+            open_ids = {a.id for a in self.pool if not a.decision}
             for a in self.live:
                 k = day_of(a)[:7]
                 m[k][0] += 1
-                if a["id"] in open_ids:
+                if a.id in open_ids:
                     m[k][1] += 1
             return [{"month": k, "label": month_label(k + "-01") if k != "0000-00" else "Ohne Datum", "total": v[0], "open": v[1]}
                     for k, v in sorted(m.items(), reverse=True)]
         return self.memo("months", build)
 
     def swipe_queue(self, source: str) -> list[dict]:
-        undecided = [a for a in self.pool if not a.get("decision")]
+        undecided = [a for a in self.pool if not a.decision]
         if source == "all" or not source:
             lst = undecided
         elif source.startswith("month:"):
@@ -488,9 +578,9 @@ class Library:
             lst = [a for a in undecided if day_of(a)[:7] == mo]
         elif source.startswith("event:"):
             ids = set(self.group_ids("event", source[6:]))
-            lst = [a for a in undecided if a["id"] in ids]
+            lst = [a for a in undecided if a.id in ids]
         elif source.startswith("cat:"):
-            lst = [a for a in self.category(source[4:]) if not a.get("decision")]
+            lst = [a for a in self.category(source[4:]) if not a.decision]
             return lst
         elif source == "random":
             import random
@@ -500,16 +590,16 @@ class Library:
         else:
             lst = []
         new_first = self.settings.get("swipe_order", "new") != "old"
-        return sorted(lst, key=lambda a: a.get("taken") or 0, reverse=new_first)
+        return sorted(lst, key=lambda a: a.taken or 0, reverse=new_first)
 
     # ------------------------------------------------------------------ Übersicht
     def overview(self) -> dict:
         def size(lst):
-            return sum(a.get("size") or 0 for a in lst)
+            return sum(a.size or 0 for a in lst)
         cats = {}
         for c in ("blurry", "dark", "screenshots", "messenger", "shortvideos", "large"):
             lst = self.category(c)
-            cats[c] = {"count": len(lst), "bytes": size(lst), "covers": [a["id"] for a in lst[:4]]}
+            cats[c] = {"count": len(lst), "bytes": size(lst), "covers": [a.id for a in lst[:4]]}
         d = self.duplicates()
         cats["duplicates"] = {"count": len(d), "items": sum(len(g["assets"]) - len(g["keep"]) for g in d), "bytes": sum(g["bytes"] for g in d),
                               "covers": [g["assets"][0]["id"] for g in d[:4]]}
@@ -518,14 +608,14 @@ class Library:
                           "covers": [g["keep"][0] for g in b[:4]]}
         r = self.raw_info()
         cats["raw"] = {"count": len(r["orphans"]), "bytes": size(r["orphans"]), "pairs": len(r["pairs"]), "unstacked": len(r["unstacked"]),
-                       "raw_only": r["raw_only"], "raw_bytes": r["raw_bytes"], "covers": [a["id"] for a in r["orphans"][:4]]}
-        imgs = [a for a in self.live if a["type"] == "IMAGE"]
-        analyzed = sum(1 for a in imgs if a.get("bright") is not None)
+                       "raw_only": r["raw_only"], "raw_bytes": r["raw_bytes"], "covers": [a.id for a in r["orphans"][:4]]}
+        imgs = [a for a in self.live if a.type == "IMAGE"]
+        analyzed = sum(1 for a in imgs if a.bright is not None)
         ev = self.events()
         return {
-            "library": {"photos": len(imgs), "videos": sum(1 for a in self.live if a["type"] == "VIDEO"), "bytes": size(self.live),
-                        "noalbum": sum(1 for a in self.live if not a["in_album"]), "analyzed": analyzed,
-                        "reviewed": sum(1 for a in self.live if a.get("decision") in ("keep", "fav")),
+            "library": {"photos": len(imgs), "videos": sum(1 for a in self.live if a.type == "VIDEO"), "bytes": size(self.live),
+                        "noalbum": sum(1 for a in self.live if not a.in_album), "analyzed": analyzed,
+                        "reviewed": sum(1 for a in self.live if a.decision in ("keep", "fav")),
                         "first": day_of(self.live[0]) if self.live else None},
             "pending": {"count": len(self.pending), "bytes": size(self.pending)},
             "cats": cats,
@@ -536,7 +626,7 @@ class Library:
 
 def _misfire(a: dict) -> bool:
     """Fehlaufnahme: fast schwarz ohne helle Stellen, einfarbig oder völlig überbelichtet."""
-    b, c, hi = a["bright"], a.get("contrast") or 0, a.get("hi")
+    b, c, hi = a.bright, a.contrast or 0, a.hi
     if hi is None:
         hi = b + 2.5 * c
     if b < 30 and hi < 60:          # schwarz (Hosentasche, Objektivdeckel) – Nachtfotos haben helle Lichter
@@ -547,17 +637,17 @@ def _misfire(a: dict) -> bool:
 
 
 def _cover(lst: list[dict]) -> dict:
-    imgs = [a for a in lst if a["type"] == "IMAGE" and not is_raw(a)] or lst
-    return max(imgs, key=lambda a: (bool(a["fav"]), (a.get("sharp") or 0) > 60, (a.get("bright") or 0) > 60, a.get("sharp") or 0))
+    imgs = [a for a in lst if a.type == "IMAGE" and not a.raw] or lst
+    return max(imgs, key=lambda a: (bool(a.fav), (a.sharp or 0) > 60, (a.bright or 0) > 60, a.sharp or 0))
 
 
 def _place_name(lst: list[dict], home_country: str | None) -> str | None:
-    located = [a for a in lst if a.get("city") or a.get("country")]
+    located = [a for a in lst if a.city or a.country]
     if not located:
         return None
-    countries = Counter(a.get("country") for a in located if a.get("country"))
-    cities = Counter(a.get("city") for a in located if a.get("city"))
-    states = Counter(a.get("state") for a in located if a.get("state"))
+    countries = Counter(a.country for a in located if a.country)
+    cities = Counter(a.city for a in located if a.city)
+    states = Counter(a.state for a in located if a.state)
     n = len(located)
     if cities:
         city, cn = cities.most_common(1)[0]
@@ -576,13 +666,67 @@ def _place_name(lst: list[dict], home_country: str | None) -> str | None:
     return None
 
 
+_libs: dict[str, Library] = {}
+_lib_locks: dict[str, threading.Lock] = {}
+
+
+def _owner_lock(owner: str) -> threading.Lock:
+    with _cache_lock:
+        return _lib_locks.setdefault(owner, threading.Lock())
+
+
 def library(owner: str) -> Library:
-    key = (db.version(owner),)
-    with _cache_lock:
-        hit = _cache.get(owner)
-        if hit and hit[0] == key:
-            return hit[1]
-    lib = Library(owner)
-    with _cache_lock:
-        _cache[owner] = (key, lib)
-    return lib
+    """Die Bibliothek eines Benutzers – wird nur einmal geladen (auch wenn viele Anfragen gleichzeitig kommen)."""
+    lib = _libs.get(owner)
+    if lib is not None and lib.gen == db.version(owner):
+        return lib
+    with _owner_lock(owner):
+        lib = _libs.get(owner)
+        if lib is None or lib.gen != db.version(owner):
+            _libs.pop(owner, None)
+            lib = None  # alten Speicher erst freigeben, dann neu laden
+            lib = Library(owner)
+            _libs[owner] = lib
+        return lib
+
+
+def update(owner: str, ids, **fields) -> None:
+    """Felder von Fotos im Speicher ändern (die Datenbank ändert der Aufrufer)."""
+    with _owner_lock(owner):
+        lib = _libs.get(owner)
+        if lib is None:
+            return
+        for i in ids:
+            a = lib.by_id.get(i)
+            if a is not None:
+                for k, v in fields.items():
+                    setattr(a, k, v)
+        lib.touch()
+
+
+def update_analysis(owner: str, results) -> None:
+    """Prüfergebnisse übernehmen: (id, sharp, bright, contrast, hi, dhash)."""
+    with _owner_lock(owner):
+        lib = _libs.get(owner)
+        if lib is None:
+            return
+        for i, sharp, bright, contrast, hi, dh in results:
+            a = lib.by_id.get(i)
+            if a is not None:
+                a.sharp = None if sharp is None else round(sharp, 1)
+                a.bright = None if bright is None else round(bright, 1)
+                a.contrast = None if contrast is None else round(contrast, 1)
+                a.hi = None if hi is None else round(hi, 1)
+                a.dhash = dh
+        lib.touch()
+
+
+def touch(owner: str) -> None:
+    lib = _libs.get(owner)
+    if lib is not None:
+        lib.touch()
+
+
+def pending_summary(owner: str) -> dict:
+    lst = library(owner).pending
+    return {"count": len(lst), "bytes": sum(a.size or 0 for a in lst)}

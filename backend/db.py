@@ -214,7 +214,6 @@ def set_user_settings(owner: str, values: dict) -> dict:
             cur[k] = str(v)[:40]
     run("INSERT OR IGNORE INTO user_meta (owner) VALUES (?)", (owner,))
     run("UPDATE user_meta SET settings=? WHERE owner=?", (json.dumps(cur), owner))
-    bump(owner)
     return cur
 
 

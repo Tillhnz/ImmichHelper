@@ -59,6 +59,28 @@ export async function renderSettings({ el, logout, setTheme, currentTheme, start
   }
 
   await drawLib();
+
+  // Diagnose
+  const diagBox = h("div");
+  const diagBtn = h("button", { class: "btn" }, icon("refresh", "sm"), "Verbindung testen");
+  diagBtn.addEventListener("click", () => withBusy(diagBtn, async () => {
+    try {
+      const d = await api("/system/diag");
+      clear(diagBox).append(h("div", { class: "list", style: { marginTop: "14px" } },
+        ...d.checks.map(ch => h("div", { class: "list-item" }, icon(ch.ok ? "checkCircle" : "xCircle", "sm"),
+          h("div", { class: "grow" }, h("div", { class: "title" }, ch.label), h("div", { class: "meta", style: { whiteSpace: "normal" } }, ch.detail)),
+          h("span", { class: `badge ${ch.ok ? (ch.ms < 800 ? "ok" : "warn") : "bad"}` }, `${num(ch.ms)} ms`))),
+        h("div", { class: "list-item" }, icon("server", "sm"), h("div", { class: "grow" }, h("div", { class: "title" }, "ImmichHelper"),
+          h("div", { class: "meta", style: { whiteSpace: "normal" } }, `${num(d.assets)} Fotos/Videos geladen in ${num(d.library_ms)} ms · Arbeitsspeicher ${num(d.ram_mb_after)} MB · `
+            + `Bilder-Zwischenspeicher ${d.cache.mem_mb}/${d.cache.mem_cap_mb} MB im RAM, ${num(Math.round(d.cache.disk_mb))}/${num(d.cache.disk_cap_mb)} MB auf der Platte`)))));
+    } catch (e) { errorToast(e); }
+  }));
+  el.append(h("h2", { class: "section" }, icon("shield", "sm"), "Diagnose"),
+    h("div", { class: "card" }, h("div", { class: "row wrap" },
+      h("div", { style: { flex: 1, minWidth: "220px" } }, h("div", { style: { fontWeight: 650 } }, "Laden Bilder nicht oder ist es langsam?"),
+        h("div", { class: "muted small" }, "Prüft, wie schnell Immich Vorschaubilder liefert, und zeigt den Speicherbedarf. Hilfreich, wenn du ein Problem meldest.")),
+      diagBtn), diagBox));
+
   if (!state.user.admin) { el.append(h("p", { class: "muted small", style: { marginTop: "24px" } }, `ImmichHelper ${state.version}`)); return; }
 
   // Immich-Verbindung

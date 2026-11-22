@@ -116,11 +116,11 @@ IH_IMMICH_URL=${IH_IMMICH_URL:-}
 IH_IMMICH_INSECURE=0
 
 # Zwischenspeicher für Vorschaubilder (Arbeitsspeicher / Festplatte des Containers) in MB
-IH_THUMB_MEM_MB=192
+IH_THUMB_MEM_MB=48
 IH_THUMB_DISK_MB=1500
 
 # Wie viele Fotos gleichzeitig geprüft werden (mehr = schneller, aber mehr Last für Immich)
-IH_ANALYZE_WORKERS=4
+IH_ANALYZE_WORKERS=3
 
 # IP-Adressen eines Reverse-Proxys (z. B. Nginx Proxy Manager), kommagetrennt
 IH_TRUSTED_PROXIES=127.0.0.1
@@ -138,6 +138,8 @@ EOF
   ok "Konfiguration: $ENV_FILE"
 else
   grep -q '^IH_REPO=' "$ENV_FILE" && sed -i "s#^IH_REPO=.*#IH_REPO=${REPO}#" "$ENV_FILE" || echo "IH_REPO=${REPO}" >> "$ENV_FILE"
+  # 1.1.0: sparsamere Standardwerte (alte Werte haben zu viel Arbeitsspeicher belegt)
+  sed -i 's/^IH_THUMB_MEM_MB=192$/IH_THUMB_MEM_MB=48/; s/^IH_ANALYZE_WORKERS=4$/IH_ANALYZE_WORKERS=3/' "$ENV_FILE"
 fi
 mkdir -p "$STATE_DIR"
 chmod 700 "$STATE_DIR"
@@ -154,6 +156,8 @@ Wants=network-online.target
 Type=simple
 EnvironmentFile=${ENV_FILE}
 Environment=IH_STATE_DIR=${STATE_DIR}
+# Python mit vielen Threads: weniger Speicher-Bereiche, damit der Arbeitsspeicher nicht unnötig wächst
+Environment=MALLOC_ARENA_MAX=2
 WorkingDirectory=${INSTALL_DIR}
 ExecStart=/usr/bin/env bash -c 'exec ${INSTALL_DIR}/.venv/bin/uvicorn backend.app:app --host "\${IH_BIND:-0.0.0.0}" --port "\${IH_PORT:-8080}" --proxy-headers --forwarded-allow-ips "\${IH_TRUSTED_PROXIES:-127.0.0.1}" --no-server-header --log-level warning --timeout-keep-alive 30'
 Restart=on-failure

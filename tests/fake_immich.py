@@ -44,12 +44,17 @@ class Lib:
         self.tokens: set[str] = set()
         self.calls: list[tuple] = []
         self.thumb_calls = 0
-        self.build()
+        self._render_cache: dict = {}
+        # FAKE_SCALE=180 → ca. 40.000 Fotos (die Beispielbibliothek wiederholt, je ein Jahr früher)
+        for k in range(max(1, int(os.environ.get("FAKE_SCALE", "1")))):
+            self._off = timedelta(days=366 * k)
+            self.build()
 
     # -----------------------------------------------------------------------
     def add(self, name, when: datetime, *, kind="IMAGE", scene=0, shift=0, blur=0, dark=False, flat=False, city=None,
             country=None, state=None, make=None, model=None, size=None, dur=None, fav=False, archived=False, w=4000, h=3000):
         aid = _uuid(self.rng)
+        when = when - getattr(self, "_off", timedelta(0))
         iso = when.astimezone(timezone.utc).isoformat().replace("+00:00", ".000Z")
         local = when.replace(tzinfo=None).isoformat() + ".000Z"
         self.assets[aid] = {
@@ -151,6 +156,16 @@ class Lib:
 
     def render(self, aid: str, size: str) -> bytes:
         sp = self.spec[aid]
+        ck = (sp["scene"], sp["shift"], sp["blur"], sp["dark"], sp["flat"], size)
+        if ck in self._render_cache:
+            return self._render_cache[ck]
+        if len(self._render_cache) > 600:
+            self._render_cache.clear()
+        data = self._render(sp, size)
+        self._render_cache[ck] = data
+        return data
+
+    def _render(self, sp: dict, size: str) -> bytes:
         W = 1440 if size == "preview" else 250
         H = int(W * 0.75)
         bases = sorted(glob.glob(os.environ.get("FAKE_PHOTOS", "/nonexistent") + "/*"))

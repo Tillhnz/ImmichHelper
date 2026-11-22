@@ -142,6 +142,10 @@ def test_flow(env):
     assert cats["bursts"]["count"] >= 1
     assert cats["raw"]["pairs"] == 18 and cats["raw"]["unstacked"] == 18
 
+    # Messenger: Quellen als Liste von [Name, Anzahl] (die Oberfläche erwartet eine Liste)
+    _, ms = c.get("/api/cat/messenger")
+    assert ms["sources"] and all(isinstance(x, list) and len(x) == 2 for x in ms["sources"])
+
     # Favorit und archiviertes Foto
     _, bl = c.get("/api/cat/blurry?limit=500")
     names = {a["name"] for a in bl["items"]}
@@ -249,6 +253,10 @@ def test_flow(env):
     code, r = c.req("PUT", "/api/settings", {"blur_threshold": 0, "unbekannt": 1})
     assert r["settings"]["blur_threshold"] == 0 and "unbekannt" not in r["settings"]
     assert c.get("/api/cat/blurry")[1]["total"] == 0 < bl["total"]
+
+    # Selbsttest
+    code, d = c.get("/api/system/diag")
+    assert code == 200 and all(ch["ok"] for ch in d["checks"]) and len(d["checks"]) == 3 and d["assets"] > 100
 
     # Abmelden
     c.post("/api/logout")
